@@ -67,6 +67,12 @@ struct stack_info {
   intnat local_sp;
   void* local_top;
   intnat local_limit;
+
+  /* Dynamic binding */
+  /* TODO: Consider making this a table of bindings */
+  /* TODO: improve the names of these slots */
+  value dyn;
+  value bind;
 };
 
 #ifdef STACK_GUARD_PAGES
@@ -74,7 +80,7 @@ struct stack_info {
 #define Stack_base(stk) ((value*)(((char*) (stk)) + 2 * caml_plat_pagesize))
 // We can assume that mmap returns page-aligned addresses.
 #define Protected_stack_page(block) (((char*) (block)) + caml_plat_pagesize)
-#else 
+#else
 #define Stack_base(stk) ((value*)(stk + 1))
 #endif
 
@@ -325,6 +331,20 @@ CAMLnoret CAMLextern void caml_raise_continuation_already_resumed (void);
 CAMLnoret CAMLextern void caml_raise_unhandled_effect (value effect);
 
 value caml_make_unhandled_effect_exn (value effect);
+
+/* Systhreads interface to dynamic bindings support */
+
+typedef struct dynamic_thread_s *dynamic_thread_t;
+
+/* parent is NULL for the first thread when systhreads initializes */
+extern dynamic_thread_t caml_dynamic_new_thread(dynamic_thread_t parent);
+extern void caml_dynamic_delete_thread(dynamic_thread_t);
+extern void caml_dynamic_enter_thread(dynamic_thread_t);
+extern void caml_dynamic_flush_thread(dynamic_thread_t);
+extern void caml_dynamic_scan_thread_roots(dynamic_thread_t,
+                                           scanning_action,
+                                           scanning_action_flags,
+                                           void *);
 
 #endif /* CAML_INTERNALS */
 

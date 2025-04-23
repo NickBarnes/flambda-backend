@@ -20,6 +20,7 @@
 
 #include "caml/config.h"
 #include <string.h>
+#include <stdbool.h>
 #include <stdio.h>
 #ifdef HAS_UNISTD
 #include <unistd.h>
@@ -335,6 +336,8 @@ alloc_size_class_stack_noexc(mlsize_t wosize, int cache_bucket, value hval,
   stack->local_sp = 0;
   stack->local_top = NULL;
   stack->local_limit = 0;
+  stack->dyn = Val_unit;
+  stack->bind = Val_unit;
 #ifdef DEBUG
   stack->magic = 42;
 #endif
@@ -618,6 +621,10 @@ void caml_scan_stack(
 
     scan_stack_frames(f, fflags, fdata, stack, gc_regs, locals);
 
+    /* Scan dynamic binding, both key and value */
+    f(fdata, stack->dyn, &stack->dyn);
+    f(fdata, stack->bind, &stack->bind);
+
     f(fdata, Stack_handle_value(stack), &Stack_handle_value(stack));
     f(fdata, Stack_handle_exception(stack), &Stack_handle_exception(stack));
     f(fdata, Stack_handle_effect(stack), &Stack_handle_effect(stack));
@@ -719,6 +726,10 @@ void caml_scan_stack(
         f(fdata, v, sp);
       }
     }
+
+    /* Scan dynamic binding, both key and value */
+    f(fdata, stack->dyn, &stack->dyn);
+    f(fdata, stack->bind, &stack->bind);
 
     if (is_scannable(fflags, Stack_handle_value(stack)))
       f(fdata, Stack_handle_value(stack), &Stack_handle_value(stack));
@@ -1098,4 +1109,297 @@ value caml_make_unhandled_effect_exn (value effect)
 CAMLexport void caml_raise_unhandled_effect (value effect)
 {
   caml_raise(caml_make_unhandled_effect_exn(effect));
+}
+
+/**** Dynamic Binding ****/
+
+/* Implementation of primitives to support Dynamic.t */
+
+extern value caml_fresh_oo_id(value v);
+
+/* Making a dynamic value */
+
+CAMLprim value caml_dynamic_make(value val)
+{
+  CAMLparam1(val);
+  /* TODO: consider other hash functions. This one is ~unique, which is nice */
+  value hash = caml_fresh_oo_id(Val_unit);
+  value dyn = caml_alloc_2(0, hash, val);
+  CAMLreturn(dyn);
+}
+
+#define Val_dyn(dyn) (atomic_load(Op_atomic_val(dyn) + 1))
+#define Hash_dyn(dyn) (Long_val(Field(dyn, 0)))
+
+/* Per-thread cache: direct-mapped. TODO: Stephen Dolan's wild plan to
+ * use vector instructions to do a fully-associative LRU cache. */
+
+#define DYNAMIC_CACHE_BITS 3
+#define DYNAMIC_CACHE_SIZE (1 << DYNAMIC_CACHE_BITS)
+
+typedef struct {
+  value dyn;
+  value val;
+} binding_s, *binding_t;
+
+/* Hash tables of bindings. Linear probing, add-only, growing when half full.
+ *
+ * At present we only use these for per-thread base values (those set
+ * with set_root), but I'm keeping this code generic as we may want
+ * other binding hash tables in future. */
+
+#define DYNAMIC_INIT_CAPACITY 8
+
+typedef struct {
+  size_t mask; /* capacity - 1 */
+  size_t count;
+  binding_t bindings;
+} binding_table_s, *binding_table_t;
+
+static void dynamic_table_fresh(binding_table_t table)
+{
+  table->mask = (size_t)-1;
+  table->count = 0;
+  table->bindings = NULL;
+}
+
+static void dynamic_table_add(binding_table_t table, value dyn, value val)
+{
+  size_t mask = table->mask;
+  value hash = Hash_dyn(dyn);
+  size_t i = hash & mask;
+  size_t j = i;
+  while(table->bindings[j].dyn != Val_unit) { /* collision */
+    j = (j + 1) & mask; /* linear probing */
+    CAMLassert (j != i); /* Caller guarantees table has space */
+  }
+  table->bindings[j].dyn = dyn;
+  table->bindings[j].val = val;
+}
+
+static bool dynamic_table_grow(binding_table_t table)
+{
+  size_t old_capacity = table->mask + 1;
+  size_t new_capacity = old_capacity ? old_capacity * 2 : DYNAMIC_INIT_CAPACITY;
+  size_t new_mask = new_capacity - 1;
+  CAMLassert(Is_power_of_2(new_capacity));
+
+  binding_t new_bindings = caml_stat_alloc_noexc(sizeof(binding_s) * new_capacity);
+  if (!new_bindings) {
+    return false;
+  }
+  for (size_t j = 0; j < new_capacity; ++ j) { /* ensure new table is empty */
+    new_bindings[j].dyn = Val_unit;
+  }
+  binding_t old_bindings = table->bindings;
+  table->mask = new_mask;
+  table->bindings = new_bindings;
+
+  /* Copy existing bindings */
+  for (size_t i = 0; i < old_capacity; ++ i) {
+    if (old_bindings[i].dyn != Val_unit) {
+      dynamic_table_add(table, old_bindings[i].dyn, old_bindings[i].val);
+    }
+  }
+  if (old_bindings) {
+    caml_stat_free(old_bindings);
+  }
+  table->bindings = new_bindings;
+  table->mask = new_mask;
+  return true;
+}
+
+/* Find the binding of `dyn` in `table`, or an empty binding if not
+ * present. Returns the binding in `*binding_out`, and a bool
+ * indicating whether the binding was found. */
+
+static bool dynamic_table_find(binding_table_t table, value dyn, binding_t *binding_out)
+{
+  uintnat hash = Hash_dyn(dyn);
+  size_t i = hash & table->mask;
+  while (true) {
+    binding_t binding = table->bindings + i;
+    if (binding->dyn == dyn) { /* Found */
+      *binding_out = binding;
+      return true;
+    } else if (binding->dyn == Val_unit) { /* Not found */
+      *binding_out = binding;
+      return false;
+    }
+    /* Linear probe */
+    i = (i + 1) & table->mask;
+  }
+}
+
+/* Set `dyn` to `val` in `table`. Update if already present; otherwise
+ * add (growing the table if half-full). */
+
+static bool dynamic_table_bind(binding_table_t table, value dyn, value val)
+{
+  binding_t binding = NULL;
+  bool found = dynamic_table_find(table, dyn, &binding);
+  CAMLassert(binding);
+  if (found) { /* Update binding */
+    binding->val = val;
+  } else { /* Not found */
+    if (table->count * 2 == table->mask+1) {
+      /* grow when half-full (includes the special case of being empty) */
+      bool res = dynamic_table_grow(table);
+      if (!res) {
+        return res;
+      }
+      dynamic_table_add(table, dyn, val);
+    } else {
+      CAMLassert(binding->dyn == Val_unit);
+      binding->dyn = dyn;
+      binding->val = val;
+    }
+    ++ table->count;
+  }
+  return true;
+}
+
+/* Per-thread dynamic binding data structure */
+
+typedef struct dynamic_thread_s {
+  binding_s cache[DYNAMIC_CACHE_SIZE];
+  binding_table_s base;
+} dynamic_thread_s, *dynamic_thread_t;
+
+static void dynamic_flush_cache(dynamic_thread_t thread)
+{
+  /* Clear keys */
+  for (size_t i = 0; i < DYNAMIC_CACHE_SIZE; ++i) {
+    thread->cache[i].dyn = Val_unit;
+  }
+}
+
+/* parent is NULL for the first thread when systhreads initializes */
+
+CAMLexport dynamic_thread_t caml_dynamic_new_thread(dynamic_thread_t parent)
+{
+  dynamic_thread_t res = caml_stat_alloc_noexc(sizeof(dynamic_thread_s));
+  if (!res) {
+    goto fail_alloc;
+  }
+  /* Not even going to think about the semantics of copying cache entries */
+  dynamic_flush_cache(res);
+ dynamic_table_fresh(&res->base);
+
+  if (parent && parent->base.count) { /* Existing base bindings to copy */
+    size_t capacity = parent->base.mask + 1;
+    binding_t new_bindings = caml_stat_alloc_noexc(sizeof(binding_s) * capacity);
+    if (!new_bindings) {
+      goto fail_alloc_bindings;
+    }
+    memcpy(new_bindings, parent->base.bindings, sizeof(binding_s) * capacity);
+    res->base.mask = parent->base.mask;
+    res->base.count = parent->base.count;
+    res->base.bindings = new_bindings;
+  }
+  return res;
+fail_alloc_bindings:
+  caml_stat_free(res);
+fail_alloc:
+  return NULL;
+}
+
+CAMLexport void caml_dynamic_delete_thread(dynamic_thread_t thread)
+{
+  if (thread->base.bindings) {
+    caml_stat_free(thread->base.bindings);
+  }
+  caml_stat_free(thread);
+}
+
+CAMLexport void caml_dynamic_flush_thread(dynamic_thread_t thread)
+{
+  dynamic_flush_cache(thread);
+}
+
+CAMLexport void caml_dynamic_enter_thread(dynamic_thread_t thread)
+{
+  Caml_state->dynamic_bindings = thread;
+}
+
+CAMLexport void caml_dynamic_scan_thread_roots(dynamic_thread_t thread,
+                                               scanning_action f,
+                                               scanning_action_flags fflags,
+                                               void *fdata)
+{
+  for (size_t i = 0; i < DYNAMIC_CACHE_SIZE; ++i) {
+    if (thread->cache[i].dyn != Val_unit) {
+      f(fdata, thread->cache[i].dyn, &thread->cache[i].dyn);
+      f(fdata, thread->cache[i].val, &thread->cache[i].val);
+    }
+  }
+  for (size_t i = 0; i < (size_t)thread->base.mask + 1; ++i) {
+    if (thread->base.bindings[i].dyn != Val_unit) {
+      f(fdata, thread->base.bindings[i].dyn, &thread->base.bindings[i].dyn);
+      f(fdata, thread->base.bindings[i].val, &thread->base.bindings[i].val);
+    }
+  }
+
+}
+
+CAMLprim value caml_dynamic_set_root(value dyn, value val)
+{
+  CAMLparam2(dyn, val); /* TODO: remove unless we can GC */
+  dynamic_thread_t thread = Caml_state->dynamic_bindings;
+  CAMLassert(thread);
+  bool res = dynamic_table_bind(&thread->base, dyn, val);
+  if (!res) {
+    caml_raise_out_of_memory();
+  }
+
+  /* invalidate cache */
+  uintnat hash = Hash_dyn(dyn);
+  uintnat index = hash & (DYNAMIC_CACHE_SIZE - 1);
+  binding_t entry = thread->cache + index;
+  if (entry->dyn == dyn) {
+    entry->dyn = Val_unit;
+  }
+
+  CAMLreturn(Val_unit);
+}
+
+CAMLprim value caml_dynamic_get(value dyn)
+{
+  uintnat hash = Hash_dyn(dyn);
+  uintnat index = hash & (DYNAMIC_CACHE_SIZE - 1);
+  dynamic_thread_t thread = Caml_state->dynamic_bindings;
+  CAMLassert(thread);
+  binding_t entry = thread->cache + index;
+  if (entry->dyn == dyn) {
+    return entry->val;
+  }
+  value val;
+  /* Not in cache; let's look at the fiber */
+  CAMLassert(Caml_state->current_stack);
+  struct stack_info *stack = Caml_state->current_stack;
+  while (stack) {
+    if (dyn == stack->dyn) {
+      val = stack->bind;
+      goto found;
+    }
+    stack = Stack_parent(stack);
+  }
+
+  /* Not bound on a fiber; check the thread base bindings */
+  binding_t binding = NULL;
+  bool found = dynamic_table_find(&thread->base, dyn, &binding);
+  CAMLassert(binding);
+  if (found) {
+    val = binding->val;
+    goto found;
+  }
+
+  /* Back to the initial binding */
+  val = Val_dyn(dyn);
+
+found:
+  /* Update cache */
+  entry->dyn = dyn;
+  entry->val = val;
+  return val;
 }
